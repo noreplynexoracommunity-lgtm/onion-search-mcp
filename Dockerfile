@@ -31,5 +31,5 @@ CMD ["/bin/sh", "-c", "\
     ngrok config add-authtoken \"$NGROK_AUTHTOKEN\" && \
     python darkweb_mcp_server.py & \
     sleep 3 && \
-    ngrok http 8000 --log=stdout \
+    ngrok http 8000 --pooling-enabled --log=stdout \
 "]

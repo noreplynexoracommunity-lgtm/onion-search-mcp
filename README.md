@@ -24,6 +24,9 @@ python darkweb_mcp_server.py
 docker build -t darkweb-mcp .
 docker run -e NGROK_AUTHTOKEN=twoj_token darkweb-mcp
 ```
+Token jest wstrzykiwany do ngroka przez `ngrok config add-authtoken` w starcie kontenera —
+nie ma pliku `ngrok.yml` z `${NGROK_AUTHTOKEN}` (ngrok nie rozwija zmiennych w configu).
+
 Ngrok wypisze publiczny URL — dolacz `/mcp` na koncu i wpisz w kliencie MCP (Gumloop / Claude Desktop).
 
 ## Zmienne srodowiskowe
