@@ -1,0 +1,10 @@
+SocksPort 9050
+# Build several preemptive circuits so concurrent crawling has lanes ready
+CircuitBuildTimeout 60
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 600
+NewCircuitPeriod 30
+NumEntryGuards 8
+# Allow many simultaneous streams from the crawler's thread pool
+MaxClientCircuitsPending 64
+Log notice stdout
