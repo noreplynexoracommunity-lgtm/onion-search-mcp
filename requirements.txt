@@ -1,7 +1,4 @@
-fastapi
-uvicorn[standard]
-requests
+fastmcp>=2.3.0
 requests[socks]
-PySocks
 beautifulsoup4
-lxml
+PySocks

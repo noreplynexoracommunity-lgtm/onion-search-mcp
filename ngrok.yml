@@ -1,0 +1,7 @@
+version: "3"
+agent:
+  authtoken: "${NGROK_AUTHTOKEN}"
+tunnels:
+  darkweb-mcp:
+    proto: http
+    addr: 8000
