@@ -40,11 +40,12 @@ RUN printf '%s\n' \
     '    echo "[*] Tor is up (after ${i}s)."; break' \
     '  fi; sleep 1' \
     'done' \
-    'echo "[*] Launching MCP server..."' \
+    'PORT=${PORT:-8000}' \
+    'echo "[*] Launching MCP server on port $PORT..."' \
     'python onion_mcp_server.py &' \
     'SERVER_PID=$!' \
-    'echo "[*] Launching ngrok tunnel..."' \
-    'ngrok http --url=legend-caboose-overturn.ngrok-free.dev 8000 &' \
+    'echo "[*] Launching ngrok tunnel -> 127.0.0.1:$PORT ..."' \
+    'ngrok http --url=legend-caboose-overturn.ngrok-free.dev --pooling-enabled "$PORT" &' \
     'wait -n $TOR_PID $SERVER_PID' \
     > /app/start.sh && chmod +x /app/start.sh
 
