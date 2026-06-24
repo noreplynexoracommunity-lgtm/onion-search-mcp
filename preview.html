@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="pl">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>blender-mcp · live viewport</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 0;
+    background: #0a0a0c;
+    color: #e6e6e8;
+    font-family: ui-monospace, "JetBrains Mono", Menlo, Consolas, monospace;
+    min-height: 100vh;
+    display: flex; flex-direction: column;
+  }
+  header {
+    display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 22px;
+    border-bottom: 1px solid #1c1c22;
+    background: #0d0d11;
+  }
+  header h1 {
+    font-size: 14px; margin: 0; letter-spacing: 0.08em;
+    text-transform: uppercase; color: #b8b8c0;
+  }
+  header h1 span { color: #ff7a3a; }
+  .status {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-size: 12px; color: #9a9aa4;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: #444;
+    transition: background 0.3s;
+  }
+  .dot.live { background: #29d27a; box-shadow: 0 0 10px #29d27a; }
+  .dot.idle { background: #d2a929; }
+  .dot.dead { background: #d23030; }
+  main {
+    flex: 1; display: grid; place-items: center;
+    padding: 22px;
+  }
+  .viewport {
+    width: 100%; max-width: 1400px;
+    aspect-ratio: 16/9;
+    background: #050507;
+    border: 1px solid #1c1c22;
+    border-radius: 10px;
+    overflow: hidden;
+    position: relative;
+    box-shadow: 0 0 60px rgba(255, 122, 58, 0.08) inset;
+  }
+  .viewport img {
+    width: 100%; height: 100%;
+    object-fit: contain;
+    display: block;
+  }
+  .viewport .empty {
+    position: absolute; inset: 0;
+    display: flex; align-items: center; justify-content: center;
+    color: #4a4a52; font-size: 13px; letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  footer {
+    padding: 12px 22px;
+    border-top: 1px solid #1c1c22;
+    background: #0d0d11;
+    display: flex; justify-content: space-between;
+    font-size: 11px; color: #6a6a72;
+  }
+  kbd {
+    background: #1c1c22; padding: 2px 6px; border-radius: 4px;
+    border: 1px solid #28282f; font-size: 10px;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>blender·<span>mcp</span> &nbsp; live viewport</h1>
+  <div class="status">
+    <span id="status-text">laczenie...</span>
+    <span id="status-dot" class="dot"></span>
+  </div>
+</header>
+
+<main>
+  <div class="viewport">
+    <div class="empty" id="empty">czekam na pierwsza klatke z blendera...</div>
+    <img id="frame" alt="" style="display:none">
+  </div>
+</main>
+
+<footer>
+  <span>WS: <code id="ws-url"></code></span>
+  <span><kbd>R</kbd> reconnect &nbsp; <kbd>F</kbd> fullscreen &nbsp; klatka: <span id="fps">0</span> fps</span>
+</footer>
+
+<script>
+const dot = document.getElementById('status-dot');
+const statusText = document.getElementById('status-text');
+const frame = document.getElementById('frame');
+const empty = document.getElementById('empty');
+const fpsEl = document.getElementById('fps');
+const wsUrlEl = document.getElementById('ws-url');
+
+let frameCount = 0;
+let lastFpsTick = performance.now();
+setInterval(() => {
+  const now = performance.now();
+  const dt = (now - lastFpsTick) / 1000;
+  fpsEl.textContent = (frameCount / dt).toFixed(1);
+  frameCount = 0;
+  lastFpsTick = now;
+}, 1000);
+
+function connect() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/preview/ws`;
+  wsUrlEl.textContent = url;
+  statusText.textContent = 'laczenie...';
+  dot.className = 'dot idle';
+
+  const ws = new WebSocket(url);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    statusText.textContent = 'polaczony, czekam na klatki';
+    dot.className = 'dot idle';
+  };
+
+  ws.onmessage = (e) => {
+    if (typeof e.data === 'string') return;     // ping/text
+    const blob = new Blob([e.data], {type: 'image/jpeg'});
+    const url = URL.createObjectURL(blob);
+    const prev = frame.src;
+    frame.onload = () => { if (prev) URL.revokeObjectURL(prev); };
+    frame.src = url;
+    frame.style.display = 'block';
+    empty.style.display = 'none';
+    statusText.textContent = 'live';
+    dot.className = 'dot live';
+    frameCount++;
+  };
+
+  ws.onclose = () => {
+    statusText.textContent = 'rozlaczono, reconnect za 2s';
+    dot.className = 'dot dead';
+    setTimeout(connect, 2000);
+  };
+
+  ws.onerror = () => {
+    dot.className = 'dot dead';
+  };
+}
+
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'r' || e.key === 'R') location.reload();
+  if (e.key === 'f' || e.key === 'F') document.documentElement.requestFullscreen();
+});
+
+connect();
+</script>
+</body>
+</html>

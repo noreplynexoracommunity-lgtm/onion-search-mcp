@@ -3,6 +3,16 @@ builder = "DOCKERFILE"
 dockerfilePath = "Dockerfile"
 
 [deploy]
+# Zabij stary kontener PRZED startem nowego -- ngrok free tier nie da
+# postawic drugiego tunelu na tej samej zarezerwowanej domenie.
 overlapSeconds = 0
 restartPolicyType = "ON_FAILURE"
 restartPolicyMaxRetries = 10
+healthcheckTimeout = 300
+
+[environments.production.variables]
+MCP_PORT = "8000"
+PREVIEW_PORT = "8001"
+BLENDER_PORT = "9876"
+PREVIEW_FPS = "8"
+# NGROK_AUTHTOKEN -- wstaw recznie w Railway (Variables) lub tu jak chcesz
