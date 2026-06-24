@@ -347,10 +347,34 @@ mcp = FastMCP("Darkweb Hacker Engine v2")
 @mcp.tool()
 async def tor_status() -> str:
     """Sprawdza Tor + zwraca aktualne wyjsciowe IP. Uzyj na poczatku sesji."""
-    html, err = await _fetch("https://check.torproject.org/api/ip", use_cache=False)
-    if err:
-        return f"Tor NIE dziala: {err}"
-    return f"Tor OK.\n{html}"
+    # 1) test bezposredniego SOCKS connect
+    try:
+        async with httpx.AsyncClient(proxy=TOR_SOCKS, timeout=15.0) as c:
+            r = await c.get("https://check.torproject.org/api/ip")
+            return f"Tor OK. {r.text}"
+    except Exception as e:
+        # 2) Diagnostyka: czy SOCKS port w ogole odpowiada?
+        import socket
+        sock_status = "nieosiagalny"
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(3)
+            host = "127.0.0.1"
+            port = 9050
+            # Parsowanie TOR_SOCKS na host:port
+            if "://" in TOR_SOCKS:
+                hp = TOR_SOCKS.split("://",1)[1]
+                if ":" in hp:
+                    host = hp.split(":")[0]
+                    port = int(hp.split(":")[1])
+            s.connect((host, port))
+            sock_status = f"OK (port {host}:{port} otwarty)"
+            s.close()
+        except Exception as se:
+            sock_status = f"BLAD: {se}"
+        return (f"Tor NIE dziala: {type(e).__name__}: {e}\n"
+                f"SOCKS port test: {sock_status}\n"
+                f"TOR_SOCKS env: {TOR_SOCKS}")
 
 
 @mcp.tool()
