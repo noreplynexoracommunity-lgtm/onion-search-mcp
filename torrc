@@ -1,0 +1,12 @@
+SocksPort 9050
+ControlPort 9051
+CookieAuthentication 1
+CookieAuthFileGroupReadable 1
+DataDirectory /var/lib/tor
+Log notice stdout
+
+# Wydajnosc: szybsze otwieranie obwodow + wiecej rownoleglosci
+NumEntryGuards 8
+CircuitBuildTimeout 30
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 600
