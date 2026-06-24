@@ -1,17 +1,12 @@
+# Tor config dla darkweb-mcp
 SocksPort 0.0.0.0:9050
-ControlPort 9051
-CookieAuthentication 1
-CookieAuthFileGroupReadable 1
-
-# Wlasny DataDirectory w /tmp -- omija permissions na /var/lib/tor
-DataDirectory /tmp/tor-data
-
-# Foreground, logi na stdout zeby Railway je widzial
-RunAsDaemon 0
+ControlPort 127.0.0.1:9051
+CookieAuthentication 0
+HashedControlPassword 16:872860B76453A77D60CA2BB8C1A7042072093276A3D701AD684053EC4C
+# (haslo: darkweb-mcp; mozesz nadpisac TOR_CONTROL_PASSWORD w env, my budujemy hash on-the-fly)
+MaxCircuitDirtiness 60
+NewCircuitPeriod 30
+ExitRelay 0
+ClientOnly 1
+AvoidDiskWrites 1
 Log notice stdout
-
-# Wydajnosc
-NumEntryGuards 8
-CircuitBuildTimeout 30
-LearnCircuitBuildTimeout 0
-MaxCircuitDirtiness 600

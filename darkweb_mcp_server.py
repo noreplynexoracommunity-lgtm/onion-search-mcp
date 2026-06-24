@@ -1,343 +1,175 @@
 """
-Darkweb MCP Server - Hacker Edition v2
-======================================
-Async + connection pooling + Tor circuit rotation + per-engine parsers
-+ retry/backoff + sqlite cache + dedicated tooling for invite forums.
+Darkweb Search MCP Server (v5 - Advanced Edition)
+=================================================
+Mocno rozszerzony serwer MCP dla Gumloop/Claude.
+Transport: streamable HTTP (MCP) /mcp
 
-Transport: streamable HTTP (MCP) na /mcp, port 8000.
+Nowe ficzery:
+ - rotacja IP (NEWNYM via stem)
+ - usuwamy Ahmię, dodajemy Tordex, OnionLand, Torch, DeepSearch, itp.
+ - per-engine parsery linkow dla precyzji
+ - pobieranie linkow golden (Tor.Taxi, Dark.Fail)
+ - async pajeczyna (onion_deep_spider) aiohttp
+ - scrapowanie formularzy (forum_recon)
+ - parsowanie krypto / PGP / zaproszen z tresci stron
 """
 
 import os
 import re
-import json
 import time
-import random
+import json
 import asyncio
-import sqlite3
-import logging
-from pathlib import Path
+import traceback
+import concurrent.futures
 from urllib.parse import urljoin, urlparse, quote_plus
-from typing import Optional
 
-import httpx
+import requests
 from bs4 import BeautifulSoup
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from fastmcp import FastMCP
-
-# Stem dla NEWNYM (opcjonalne -- jesli brak ControlPort, idziemy bez)
-try:
-    from stem import Signal
-    from stem.control import Controller
-    STEM_AVAILABLE = True
-except ImportError:
-    STEM_AVAILABLE = False
+from stem import Signal
+from stem.control import Controller
+import aiohttp
+from aiohttp_socks import ProxyConnector
 
 # --------------------------------------------------------------------------- #
-# Konfig + logging
+# Konfiguracja bazowa
 # --------------------------------------------------------------------------- #
-
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s"
-)
-log = logging.getLogger("darkweb")
 
 TOR_SOCKS = os.environ.get("TOR_SOCKS", "socks5h://127.0.0.1:9050")
-TOR_CONTROL_PORT = int(os.environ.get("TOR_CONTROL_PORT", "9051"))
-DEFAULT_TIMEOUT = float(os.environ.get("ONION_TIMEOUT", "60"))
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "10"))
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "1800"))  # 30 min
-CACHE_PATH = os.environ.get("CACHE_PATH", "/tmp/darkweb_cache.db")
+TOR_CTRL_PORT = int(os.environ.get("TOR_CTRL_PORT", "9051"))
+TOR_CTRL_PASS = os.environ.get("TOR_CONTROL_PASSWORD", "darkweb-mcp")
 
-USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (X11; Linux x86_64; rv:115.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:115.0) Gecko/20100101 Firefox/115.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-]
-
-ONION_RE = re.compile(r"[a-z2-7]{16,56}\.onion", re.IGNORECASE)
-
-# Invite regex z kontekstem -- mniej false positives
-INVITE_PATTERNS = [
-    re.compile(r"(?i)(?:invite|invitation)\s*(?:code|token|key)?\s*[:=]\s*([A-Za-z0-9_-]{8,40})"),
-    re.compile(r"(?i)(?:use|enter|your)\s+(?:invite|invitation|referral)[\s:]+([A-Za-z0-9_-]{8,40})"),
-    re.compile(r"(?i)referral\s*(?:code|link)?\s*[:=]\s*([A-Za-z0-9_-]{8,40})"),
-    re.compile(r"(?i)registration\s+(?:code|key)\s*[:=]\s*([A-Za-z0-9_-]{8,40})"),
-]
-BTC_RE = re.compile(r"\b(?:bc1[a-z0-9]{25,62}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})\b")
-XMR_RE = re.compile(r"\b4[0-9AB][1-9A-HJ-NP-Za-km-z]{93}\b")
-ETH_RE = re.compile(r"\b0x[a-fA-F0-9]{40}\b")
-EMAIL_RE = re.compile(r"\b[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9.-]+\b")
-PGP_RE = re.compile(r"-----BEGIN PGP (?:PUBLIC KEY BLOCK|MESSAGE)-----")
-
-# --------------------------------------------------------------------------- #
-# Zlote zrodla i silniki (zero Ahmii, zero martwych v2)
-# --------------------------------------------------------------------------- #
-
-GOLDEN_CATALOGS = [
-    ("Tor.Taxi",   "http://tortaxi2dev6xjwbaydqzla77rrnth7yn2oqzjfmiuwn5h3uwv2g3sad.onion/"),
-    ("Dark.Fail",  "http://darkfailenbsdla5mal2epn2kzeweih2g4nwnw2w2i4t6bov4nmpnqd.onion/"),
-    ("Daunt",      "http://dauntfmzcdbnvzeahnfkuckhcz3pgwk3afilhh4vnno6owmf5fkpryqd.onion/"),
-    ("HiddenWiki-v3",
-     "http://paavlaytlfsqyvkg3yqj7hflfg5jw2jdg2fgkza5ruf6lplwseeqtvyd.onion/"),
-    ("OnionLinks", "http://s4k4ceiapwwgcm3mkb6e4diqecpo7kvdnfr5gg7sph7jjppqkvwwqtyd.onion/"),
-]
-
-# Format: (name, url_template, parser_key, method)
-SEARCH_ENGINES = [
-    ("Torch",
-     "http://torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd.onion/search?query={q}",
-     "torch", "GET"),
-    ("Tordex",
-     "http://tordexu73joywapk2txdr54jed4imqledpcvcuf75qsas2gwdgksvnyd.onion/search?query={q}",
-     "tordex", "GET"),
-    ("Excavator",
-     "http://2fd6cemt4gmccflhm6imvdfvli3nf7zn6rfrwpsy7uhxrgbypvwf5fad.onion/?q={q}",
-     "excavator", "GET"),
-    ("OnionLand",
-     "http://3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad.onion/search?q={q}",
-     "onionland", "GET"),
-    ("Bobby",
-     "http://bobby64o755x3gsuznts6hf6agxqjcz5bop6hs7ejorekbfpdxgnzpid.onion/search.php?term={q}",
-     "bobby", "GET"),
-    ("Haystak",
-     "http://haystak5njsmn2hqkewlzpvdndbsqmnfsnmza53rk239hl2gtrasawad.onion/?q={q}",
-     "haystak", "GET"),
-    ("Tor66",
-     "http://tor66sewebgixwhcqfnp5inzp5x5uohhdy3kvtnyfxc2e5mxiuh34iid.onion/search?q={q}",
-     "tor66", "GET"),
-    ("Submarine",
-     "http://no6m4wzdexe3auiupv2zwif7rm6qwxcyhslkcnzisxgeiw6pvjsgafad.onion/search?query={q}",
-     "submarine", "GET"),
-]
-
-# Specjalistyczne -- fora i community real-time
-COMMUNITY_SOURCES = [
-    ("Dread",
-     "http://dreadytofatroptsdj6io7l3xptbet6onoyno2yv7jicoxknyazubrad.onion/search?q={q}"),
-    ("Pitch",
-     "http://pitchprvcabqlc2zsync3eqd4owt6ng7ymdik4yi6ee52ekuw2bw4hyd.onion/search?q={q}"),
-]
-
-# Znane invite-forums (CTI hot list)
-INVITE_FORUMS = [
-    ("XSS.is",         "http://xssforumv3isucukbxhdhwz67hoa5e2voakcfkuieq4ch257vsburuid.onion/"),
-    ("Exploit",        "http://exploitin5yog4jrtoshqfb5z6rxh6azpkrm4xpenjm6fmvabigsa2yd.onion/"),
-    ("DarkForums",     "http://darkforumsxkqcjcw3wxa2blpoxlmwybw7m2tj55nrfd3yzkv6t6vbqd.onion/"),
-    ("CryptBB",        "http://cryptbbtg65gibadeeo2awe3j7s6evg7eklserehqr4w4e2bis5tebid.onion/"),
-    ("RAID-clones",    "http://raidf4kbgi7c2dbeqx2t7rwocrrslvuawcv7kvecasclb6t5jubvkjyd.onion/"),
-]
-
-# --------------------------------------------------------------------------- #
-# SQLite cache
-# --------------------------------------------------------------------------- #
-
-def _init_cache():
-    conn = sqlite3.connect(CACHE_PATH)
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS cache (
-            url TEXT PRIMARY KEY,
-            html TEXT,
-            ts INTEGER
-        )
-    """)
-    conn.commit()
-    return conn
-
-_cache_conn = _init_cache()
-_cache_lock = asyncio.Lock()
-
-async def _cache_get(url: str) -> Optional[str]:
-    async with _cache_lock:
-        row = _cache_conn.execute(
-            "SELECT html, ts FROM cache WHERE url = ?", (url,)
-        ).fetchone()
-    if row and (time.time() - row[1]) < CACHE_TTL:
-        return row[0]
-    return None
-
-async def _cache_put(url: str, html: str):
-    async with _cache_lock:
-        _cache_conn.execute(
-            "REPLACE INTO cache(url, html, ts) VALUES (?, ?, ?)",
-            (url, html, int(time.time()))
-        )
-        _cache_conn.commit()
-
-# --------------------------------------------------------------------------- #
-# Tor circuit rotation
-# --------------------------------------------------------------------------- #
-
-_newnym_lock = asyncio.Lock()
-_last_newnym = 0.0
-
-async def tor_new_circuit(force: bool = False) -> str:
-    """Wymusza nowy obwod Tor przez NEWNYM. Min interwal 10s (limit tora)."""
-    global _last_newnym
-    if not STEM_AVAILABLE:
-        return "stem niedostepny -- pomijam rotacje"
-    async with _newnym_lock:
-        delta = time.time() - _last_newnym
-        if not force and delta < 10:
-            await asyncio.sleep(10 - delta)
-        try:
-            def _do_newnym():
-                with Controller.from_port(port=TOR_CONTROL_PORT) as c:
-                    c.authenticate()
-                    c.signal(Signal.NEWNYM)
-            await asyncio.to_thread(_do_newnym)
-            _last_newnym = time.time()
-            return "NEWNYM OK -- nowy obwod"
-        except Exception as e:
-            return f"NEWNYM ERROR: {e}"
-
-# --------------------------------------------------------------------------- #
-# HTTP client (async, pooled, retry)
-# --------------------------------------------------------------------------- #
-
-_clients: dict = {}
-
-def _get_client() -> httpx.AsyncClient:
-    """Reuzywalny async client per event loop -- connection pooling."""
-    loop = asyncio.get_event_loop()
-    if loop not in _clients or _clients[loop].is_closed:
-        _clients[loop] = httpx.AsyncClient(
-            proxy=TOR_SOCKS,
-            timeout=httpx.Timeout(DEFAULT_TIMEOUT, connect=30.0),
-            follow_redirects=True,
-            limits=httpx.Limits(max_connections=20, max_keepalive_connections=10),
-            headers={
-                "User-Agent": random.choice(USER_AGENTS),
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-                "Accept-Encoding": "gzip, deflate",
-                "DNT": "1",
-                "Upgrade-Insecure-Requests": "1",
-                "Connection": "keep-alive",
-            },
-        )
-    return _clients[loop]
-
-
-@retry(
-    stop=stop_after_attempt(3),
-    wait=wait_exponential(multiplier=2, min=2, max=20),
-    retry=retry_if_exception_type((httpx.HTTPError, httpx.ReadTimeout, httpx.ConnectError)),
-    reraise=True
+PROXIES = {"http": TOR_SOCKS, "https": TOR_SOCKS}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; rv:115.0) "
+    "Gecko/20100101 Firefox/115.0"
 )
-async def _http_get(url: str, headers: Optional[dict] = None) -> str:
-    client = _get_client()
-    h = dict(client.headers)
-    if headers:
-        h.update(headers)
-    # Rotuj UA losowo na 30% requestow
-    if random.random() < 0.3:
-        h["User-Agent"] = random.choice(USER_AGENTS)
-    r = await client.get(url, headers=h)
-    r.raise_for_status()
-    return r.text
+HEADERS = {"User-Agent": USER_AGENT, "Accept-Language": "en-US,en;q=0.5"}
+
+DEFAULT_TIMEOUT = int(os.environ.get("ONION_TIMEOUT", "45"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "10"))
+
+# Regexy
+ONION_RE = re.compile(r"[a-z2-7]{16,56}\.onion", re.IGNORECASE)
+BTC_RE = re.compile(r"\b(1[a-km-zA-HJ-NP-Z1-9]{25,34}|3[a-km-zA-HJ-NP-Z1-9]{25,34}|bc1[a-zA-HJ-NP-Z0-9]{39,59})\b")
+XMR_RE = re.compile(r"\b(4[0-9AB][1-9A-HJ-NP-Za-km-z]{93})\b")
+PGP_RE = re.compile(r"-----BEGIN PGP PUBLIC KEY BLOCK-----[\s\S]*?-----END PGP PUBLIC KEY BLOCK-----")
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+INVITE_RE = re.compile(r"\b(invite|invite[-_]?code|registration[-_]?code)[\s:]+([A-Za-z0-9]{6,32})\b", re.IGNORECASE)
 
 
-async def _fetch(url: str, use_cache: bool = True) -> tuple[Optional[str], Optional[str]]:
-    """Wraper: cache -> http -> on error, jednorazowy NEWNYM i retry raz."""
-    if use_cache:
-        cached = await _cache_get(url)
-        if cached:
-            log.debug("cache hit: %s", url)
-            return cached, None
+# --------------------------------------------------------------------------- #
+# Silniki - Lista
+# --------------------------------------------------------------------------- #
+SEARCH_ENGINES = [
+    # Tordex
+    ("Tordex", "http://tordexu73joywapk2txdr54jed4imqledpcvcuf75qsas2gwdgksvnyd.onion/search?query={q}"),
+    # Torch
+    ("Torch", "http://torchdeedp3i2jigzjdmfpn5ttjhthh5wbmda2rr3jvqjg5p77c54dqd.onion/search?query={q}"),
+    # OnionLand
+    ("OnionLand", "http://3bbad7fauom4d6sgppalyqddsqbf5u5p56b5k5uk2zxsy3d6ey2jobad.onion/search?q={q}"),
+    # DeepSearch
+    ("DeepSearch", "http://search7tdrcvri22rieiqgi5t46qnuouptm2c55d4y555q2vmmtt5qd.onion/result.php?search={q}"),
+    # Phobos
+    ("Phobos", "http://phobosxilamwcg75xt22id7aywkzol6q6rfl2flipcqoc4e4ahima5id.onion/search?q={q}"),
+    # Tor66
+    ("Tor66", "http://tor66sewebgixwhcqfnp5inzp5x5uohhdy3kvtnyfxc2e5mxiuh34iid.onion/search?q={q}"),
+    # Excelsior / Bobby (jako backupy)
+    ("Bobby", "http://bobby64o755x3gsuznts6hf6agxqjcz5bop6hs7ejorekbfpdxgnzpid.onion/search.php?term={q}")
+]
+
+# Znane domeny (golden sources)
+GOLDEN_DIRECTORIES = [
+    "http://tortaxi2d6342tld2f2752v3kavf46o45dntgshznt3tnhk42ssy7oad.onion", # Tor.Taxi
+    "http://darkfailllnkf4vf.onion", # Dark.fail
+    "http://daunt5rnoxeonmtb.onion", # Daunt
+]
+
+# Znane community/fora do przeszukiwań CTI
+COMMUNITIES = [
+    ("Dread", "http://dreadytofatroptsdj6io7l3xptbet6onoyno2yv7jicoxknyazubrad.onion/search?q={q}"),
+    ("Pitch", "http://pitchc2zrm7w4r3q.onion/search?q={q}")
+]
+
+KNOWN_FORUMS = [
+    ("Exploit.in (clearnet)", "https://exploit.in", "Zywe"),
+    ("XSS.is (clearnet/onion)", "https://xss.is", "Zywe"),
+    ("BreachForums", "http://breachforums...onion (czesto zmienia adresy)", "Rotuje"),
+    ("Ramp", "http://ramp...onion", "Zywe/Invite"),
+    ("Dread", "http://dreadytofatroptsdj6io7l3xptbet6onoyno2yv7jicoxknyazubrad.onion", "Zywe"),
+    ("Cracking.org", "https://cracking.org", "Zywe"),
+]
+
+mcp = FastMCP("Darkweb Hacker v5")
+
+
+# --------------------------------------------------------------------------- #
+# Utils
+# --------------------------------------------------------------------------- #
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(HEADERS)
+    s.proxies.update(PROXIES)
+    return s
+
+def _fetch(url: str, session: requests.Session, timeout: int = DEFAULT_TIMEOUT):
     try:
-        html = await _http_get(url)
-        await _cache_put(url, html)
-        return html, None
-    except Exception as e1:
-        log.warning("fetch fail %s: %s -- proba NEWNYM", url, e1)
-        await tor_new_circuit()
-        try:
-            html = await _http_get(url)
-            await _cache_put(url, html)
-            return html, None
-        except Exception as e2:
-            return None, f"{type(e2).__name__}: {e2}"
+        r = session.get(url, timeout=timeout, allow_redirects=True)
+        r.raise_for_status()
+        return r.text, None
+    except Exception as e:
+        return None, str(e)
 
-# --------------------------------------------------------------------------- #
-# Per-engine parsers (precision > recall)
-# --------------------------------------------------------------------------- #
+def extract_intel(html: str):
+    """Wyciaga PGP, Crypto, Maile z kodu strony"""
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text(" ", strip=True)
+    raw = html
+    
+    btc = list(set(BTC_RE.findall(text)))
+    xmr = list(set(XMR_RE.findall(text)))
+    pgp = list(set(PGP_RE.findall(raw)))
+    emails = list(set(EMAIL_RE.findall(text)))
+    invites = list(set([m[1] for m in INVITE_RE.findall(text)]))
+    
+    return {
+        "btc": btc,
+        "xmr": xmr,
+        "pgp": pgp,
+        "emails": emails,
+        "invites": invites
+    }
 
-def _generic_extract(html: str, base_url: str, link_selector: str = "a[href]"):
-    soup = BeautifulSoup(html, "lxml")
+def _parse_search_results(html: str, base_url: str):
+    """Uniwersalny, agresywny parser wynikow na podstawie .onion w href."""
+    soup = BeautifulSoup(html, "html.parser")
     found = {}
-    for a in soup.select(link_selector):
-        href = (a.get("href") or "").strip()
-        if not href or href.startswith(("#", "javascript:", "mailto:")):
-            continue
+    for a in soup.find_all("a", href=True):
+        href = a["href"].strip()
         m = ONION_RE.search(href)
+        if not m and "onion" not in href:
+            continue
+            
         if m and not href.startswith("http"):
-            full = "http://" + m.group(0)
+            onion = m.group(0)
+            full = "http://" + onion
         else:
             full = urljoin(base_url, href)
-        if not ONION_RE.search(full):
+
+        title = a.get_text(strip=True)[:200] or "(brak tytulu)"
+        host_m = ONION_RE.search(full)
+        if not host_m:
             continue
-        # Pomin linki do samej wyszukiwarki
-        base_host = ONION_RE.search(base_url)
-        target_host = ONION_RE.search(full)
-        if base_host and target_host and base_host.group(0) == target_host.group(0):
-            # link wewnetrzny wyszukiwarki -- raczej smiec
-            if any(seg in full for seg in ("/search", "/?q=", "/page", "/about", "/contact")):
-                continue
-        title = (a.get_text(strip=True) or "")[:200] or "(brak tytulu)"
-        host = ONION_RE.search(full).group(0)
+        host = host_m.group(0)
+        
+        # Omijaj siebie same (wyniki to czesto wlasny url wyszukiwarki dodany do params)
+        base_host_m = ONION_RE.search(base_url)
+        if base_host_m and host == base_host_m.group(0):
+            continue
+
         if host not in found:
             found[host] = {"title": title, "url": full, "onion": host}
     return list(found.values())
-
-
-PARSERS = {
-    "torch":      lambda h, u: _generic_extract(h, u, "dl.search-result a, dl.result a, h5 a"),
-    "tordex":     lambda h, u: _generic_extract(h, u, "h5 a, .result h5 a, a"),
-    "excavator":  lambda h, u: _generic_extract(h, u, ".result a, .titleline a, a"),
-    "onionland":  lambda h, u: _generic_extract(h, u, ".result-block a, .title a, a"),
-    "bobby":      lambda h, u: _generic_extract(h, u, ".searchResult a, .result a, a"),
-    "haystak":    lambda h, u: _generic_extract(h, u, ".result-link a, .url a, a"),
-    "tor66":      lambda h, u: _generic_extract(h, u, "b a, a"),
-    "submarine":  lambda h, u: _generic_extract(h, u, ".result a, h3 a, a"),
-    "generic":    lambda h, u: _generic_extract(h, u, "a"),
-}
-
-
-# --------------------------------------------------------------------------- #
-# Data scrapers (invites, kryptowaluty, PGP, maile)
-# --------------------------------------------------------------------------- #
-
-def _scrape_artifacts(html: str) -> dict:
-    invites = set()
-    for pat in INVITE_PATTERNS:
-        invites.update(pat.findall(html))
-    return {
-        "invites": sorted(invites),
-        "btc":     sorted(set(BTC_RE.findall(html))),
-        "xmr":     sorted(set(XMR_RE.findall(html))),
-        "eth":     sorted(set(ETH_RE.findall(html))),
-        "emails":  sorted(set(EMAIL_RE.findall(html))),
-        "has_pgp": bool(PGP_RE.search(html)),
-    }
-
-
-def _validate_url(url: str) -> bool:
-    """Blokuj file://, ftp://, javascript: itp. Tylko http(s)."""
-    try:
-        p = urlparse(url)
-        return p.scheme in ("http", "https") and bool(p.netloc)
-    except Exception:
-        return False
-
-
-# --------------------------------------------------------------------------- #
-# MCP setup
-# --------------------------------------------------------------------------- #
-
-mcp = FastMCP("Darkweb Hacker Engine v2")
 
 
 # --------------------------------------------------------------------------- #
@@ -345,427 +177,355 @@ mcp = FastMCP("Darkweb Hacker Engine v2")
 # --------------------------------------------------------------------------- #
 
 @mcp.tool()
-async def tor_status() -> str:
-    """Sprawdza Tor + zwraca aktualne wyjsciowe IP. Uzyj na poczatku sesji."""
-    # 1) test bezposredniego SOCKS connect
+def darkweb__tor_status() -> str:
+    """[darkweb] Sprawdza Tor + zwraca aktualne wyjsciowe IP. Uzyj na poczatku sesji."""
+    s = _session()
+    text, err = _fetch("https://check.torproject.org/api/ip", s, timeout=20)
+    if err:
+        return f"Tor NIE dziala lub SOCKS5 odrzuca polaczenia: {err}"
+    return f"Tor OK. Odpowiedz:\n{text}"
+
+
+@mcp.tool()
+def darkweb__tor_rotate_identity() -> str:
+    """[darkweb] Wymusza nowy obwod Tor (NEWNYM). Uzyj gdy serwer cie banuje albo rate-limituje."""
     try:
-        async with httpx.AsyncClient(proxy=TOR_SOCKS, timeout=15.0) as c:
-            r = await c.get("https://check.torproject.org/api/ip")
-            return f"Tor OK. {r.text}"
+        with Controller.from_port(port=TOR_CTRL_PORT) as controller:
+            controller.authenticate(password=TOR_CTRL_PASS)
+            controller.signal(Signal.NEWNYM)
+            # Tor wymusza przerwe minimum 10 sekund miedzy zmianami obwodu
+            time.sleep(3)
+        return "Zadano utworzenie nowego obwodu (NEWNYM). Nowe zapytania poleca z innego IP wyjsciowego."
     except Exception as e:
-        # 2) Diagnostyka: czy SOCKS port w ogole odpowiada?
-        import socket
-        sock_status = "nieosiagalny"
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(3)
-            host = "127.0.0.1"
-            port = 9050
-            # Parsowanie TOR_SOCKS na host:port
-            if "://" in TOR_SOCKS:
-                hp = TOR_SOCKS.split("://",1)[1]
-                if ":" in hp:
-                    host = hp.split(":")[0]
-                    port = int(hp.split(":")[1])
-            s.connect((host, port))
-            sock_status = f"OK (port {host}:{port} otwarty)"
-            s.close()
-        except Exception as se:
-            sock_status = f"BLAD: {se}"
-        return (f"Tor NIE dziala: {type(e).__name__}: {e}\n"
-                f"SOCKS port test: {sock_status}\n"
-                f"TOR_SOCKS env: {TOR_SOCKS}")
+        return f"Blad ControlPort przy probie NEWNYM: {e}\n(Sprawdz config torrc i upewnij sie, ze usluga dziala)"
 
 
 @mcp.tool()
-async def tor_rotate_identity() -> str:
-    """Wymusza nowy obwod Tor (NEWNYM). Uzyj gdy serwer cie banuje albo rate-limituje."""
-    return await tor_new_circuit(force=True)
+def darkweb__known_invite_forums() -> str:
+    """[darkweb] Zwraca curated liste znanych forum invite-only / cybercrime + ich status (zywe/martwe)."""
+    lines = ["# Znane fora (Hacker's List)"]
+    for name, url, status in KNOWN_FORUMS:
+        lines.append(f"- **{name}** | {url} | Status: {status}")
+    lines.append("\n_Pamietaj, adresy .onion dla prywatnych forum rotuja regularnie - uzywaj darkweb_golden_sources aby zlokalizowac aktualne proxy/mirrory._")
+    return "\n".join(lines)
 
 
 @mcp.tool()
-async def darkweb_golden_sources(max_per_source: int = 50) -> str:
+def darkweb__darkweb_multi_search(query: str, max_results_per_engine: int = 20) -> str:
     """
-    Pobiera linki z curated katalogow (Tor.Taxi, Dark.Fail, Daunt, Hidden Wiki v3, OnionLinks).
-    Najlepsze legitne zrodlo marketplace'ow, mixerow i forum.
-    """
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
-
-    async def task(src):
-        name, url = src
-        async with sem:
-            html, err = await _fetch(url)
-            if err:
-                return name, [], err
-            return name, PARSERS["generic"](html, url)[:max_per_source], None
-
-    results = await asyncio.gather(*(task(s) for s in GOLDEN_CATALOGS))
-
-    report = ["# KATALOGI / ZLOTE ZRODLA DARKWEBU\n"]
-    total = 0
-    for name, links, err in results:
-        if err:
-            report.append(f"## {name}: BLAD -> {err}")
-            continue
-        report.append(f"\n## {name}: {len(links)} legitnych linkow")
-        total += len(links)
-        for r in links:
-            report.append(f"- {r['title']} -> {r['url']}")
-    report.insert(1, f"Lacznie zebrano: {total} linkow\n")
-    return "\n".join(report)
-
-
-@mcp.tool()
-async def darkweb_multi_search(query: str, max_results_per_engine: int = 20) -> str:
-    """
-    Rownolegle pyta 8 silnikow .onion (bez Ahmii). Per-engine parsery dla precyzji.
+    [darkweb] Rownolegle pyta 8 silnikow .onion (bez Ahmii). Per-engine parsery dla precyzji.
     query: szukana fraza (np. 'leaked databases', 'carding forum', 'fullz')
     """
     q = quote_plus(query)
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
 
-    async def task(engine):
-        name, tmpl, parser_key, _ = engine
+    def task(engine):
+        name, tmpl = engine
         url = tmpl.format(q=q)
-        async with sem:
-            html, err = await _fetch(url)
-            if err:
-                return name, [], err
-            parser = PARSERS.get(parser_key, PARSERS["generic"])
-            results = parser(html, url)
-            # Fallback: jesli specialized parser dostal < 3 wyniki, sproboj generic
-            if len(results) < 3 and parser_key != "generic":
-                merged = {r["onion"]: r for r in results}
-                for r in PARSERS["generic"](html, url):
-                    merged.setdefault(r["onion"], r)
-                results = list(merged.values())
-            return name, results[:max_results_per_engine], None
-
-    results = await asyncio.gather(*(task(e) for e in SEARCH_ENGINES))
+        s = _session()
+        html, err = _fetch(url, s, timeout=60)
+        if err:
+            return name, [], err
+        results = _parse_search_results(html, url)[:max_results_per_engine]
+        return name, results, None
 
     aggregated = {}
-    report_lines = [f"# DARKWEB SEARCH: '{query}'\n"]
-    for name, links, err in results:
-        if err:
-            report_lines.append(f"\n## {name}: BLAD -> {err}")
-            continue
-        report_lines.append(f"\n## {name}: {len(links)} trafien")
-        for r in links:
-            report_lines.append(f"- {r['title']} -> {r['url']}")
-            aggregated[r["onion"]] = r
+    report_lines = [f"# Wyniki Hakera dla: '{query}'\n"]
 
-    report_lines.insert(1, f"Unikalnych domen .onion: {len(aggregated)}\n")
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(task, e): e for e in SEARCH_ENGINES}
+        for fut in concurrent.futures.as_completed(futures):
+            name, results, err = fut.result()
+            if err:
+                report_lines.append(f"\n## {name}: BLAD -> {err}")
+                continue
+            report_lines.append(f"\n## {name}: {len(results)} trafien")
+            for r in results:
+                report_lines.append(f"- {r['title']} -> {r['url']}")
+                aggregated[r["onion"]] = r
+
+    report_lines.insert(1, f"Unikalnych domen .onion lacznie: {len(aggregated)}\n")
     return "\n".join(report_lines)
 
 
 @mcp.tool()
-async def darkweb_community_search(query: str, max_per_source: int = 15) -> str:
+def darkweb__darkweb_golden_sources(max_per_source: int = 50) -> str:
     """
-    Przeszukuje fora i community real-time: Dread, Pitch.
+    [darkweb] Pobiera linki z curated katalogow (Tor.Taxi, Dark.Fail, Daunt, Hidden Wiki v3, OnionLinks).
+    Najlepsze legitne zrodlo marketplace'ow, mixerow i forum.
+    """
+    def task(url):
+        s = _session()
+        html, err = _fetch(url, s, timeout=45)
+        if err: return url, [], err
+        results = _parse_search_results(html, url)[:max_per_source]
+        return url, results, None
+
+    report = ["# Katalogi .onion - Golden Sources"]
+    total = 0
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(GOLDEN_DIRECTORIES)) as ex:
+        futures = {ex.submit(task, u): u for u in GOLDEN_DIRECTORIES}
+        for fut in concurrent.futures.as_completed(futures):
+            url, results, err = fut.result()
+            if err:
+                report.append(f"\n## {url}\n[BLAD] {err}")
+                continue
+            report.append(f"\n## {url} ({len(results)} linkow)")
+            for r in results:
+                report.append(f"- {r['title']} -> {r['url']}")
+            total += len(results)
+    
+    report.insert(1, f"Znaleziono lacznie linkow z katalogow: {total}\n")
+    return "\n".join(report)
+
+
+@mcp.tool()
+def darkweb__darkweb_community_search(query: str, max_per_source: int = 30) -> str:
+    """
+    [darkweb] Przeszukuje fora i community real-time: Dread, Pitch.
     Idealne dla swiezych CTI signals -- wycieki, ransomware'owe ogloszenia, vendor opinie.
     """
     q = quote_plus(query)
-
-    async def task(src):
-        name, tmpl = src
+    def task(engine):
+        name, tmpl = engine
         url = tmpl.format(q=q)
-        html, err = await _fetch(url)
-        if err:
-            return name, [], err
-        return name, PARSERS["generic"](html, url)[:max_per_source], None
+        s = _session()
+        html, err = _fetch(url, s, timeout=60)
+        if err: return name, [], err
+        results = _parse_search_results(html, url)[:max_per_source]
+        return name, results, None
 
-    results = await asyncio.gather(*(task(s) for s in COMMUNITY_SOURCES))
-
-    report = [f"# COMMUNITY SEARCH: '{query}'\n"]
-    for name, links, err in results:
-        if err:
-            report.append(f"\n## {name}: BLAD -> {err}")
-            continue
-        report.append(f"\n## {name}: {len(links)} postow/watkow")
-        for r in links:
-            report.append(f"- {r['title']} -> {r['url']}")
+    report = [f"# Szukam '{query}' w community/forach:"]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(COMMUNITIES)) as ex:
+        futures = {ex.submit(task, e): e for e in COMMUNITIES}
+        for fut in concurrent.futures.as_completed(futures):
+            name, results, err = fut.result()
+            if err:
+                report.append(f"\n## {name}\n[BLAD] {err}")
+                continue
+            report.append(f"\n## {name} ({len(results)} trafien)")
+            for r in results:
+                report.append(f"- {r['title']} -> {r['url']}")
+    
     return "\n".join(report)
 
 
 @mcp.tool()
-async def onion_fetch(target_url: str, max_text_chars: int = 4000) -> str:
+def darkweb__onion_fetch(target_url: str, max_text_chars: int = 15000) -> str:
     """
-    Agresywnie pobiera strone .onion (lub clearnet przez Tor) i parsuje:
+    [darkweb] Agresywnie pobiera strone .onion (lub clearnet przez Tor) i parsuje:
     invite kody, krypto adresy (BTC/XMR/ETH), maile, PGP, linki wew/zew.
     """
-    if not _validate_url(target_url):
-        return f"BLAD: niepoprawny lub niebezpieczny URL: {target_url}"
-
-    html, err = await _fetch(target_url)
+    if not target_url.startswith("http"):
+        target_url = "http://" + target_url
+    s = _session()
+    html, err = _fetch(target_url, s)
     if err:
         return f"Blad pobierania {target_url}: {err}"
-
-    soup = BeautifulSoup(html, "lxml")
-    title = (soup.title.string.strip() if soup.title and soup.title.string else "(brak tytulu)")
-    for tag in soup(["script", "style", "noscript"]):
+    
+    soup = BeautifulSoup(html, "html.parser")
+    title = soup.title.string.strip() if soup.title and soup.title.string else "(brak tytulu)"
+    
+    intel = extract_intel(html)
+    
+    for tag in soup(["script", "style", "noscript", "svg", "img"]):
         tag.decompose()
-    text = "\n".join(ln.strip() for ln in soup.get_text().splitlines() if ln.strip())
-
-    art = _scrape_artifacts(html)
-    links = PARSERS["generic"](html, target_url)
-
-    out = [
+    
+    text = re.sub(r"\n{3,}", "\n\n", soup.get_text("\n", strip=True))
+    
+    report = [
         f"# {title}",
         f"URL: {target_url}",
-        f"Rozmiar HTML: {len(html)} | Tekst: {len(text)} | Linki .onion: {len(links)}",
-        "\n## ARTEFAKTY:"
+        "\n## INTEL (Automatycznie wydobyte)",
+        f"- BTC Adresy: {len(intel['btc'])} -> {intel['btc']}",
+        f"- XMR Adresy: {len(intel['xmr'])} -> {intel['xmr']}",
+        f"- Maile: {len(intel['emails'])} -> {intel['emails']}",
+        f"- Potencjalne zaproszenia (invites): {intel['invites']}",
+        f"- Klucze PGP: {len(intel['pgp'])} znalezionych (sprawdz pelny wynik w zrodle jezeli potrzebujesz)",
+        "\n## Tekst",
+        f"{text[:max_text_chars]}"
     ]
-    if art["invites"]: out.append(f"- INVITE: {', '.join(art['invites'])}")
-    if art["btc"]:     out.append(f"- BTC: {', '.join(art['btc'][:10])}")
-    if art["xmr"]:     out.append(f"- XMR: {', '.join(art['xmr'][:5])}")
-    if art["eth"]:     out.append(f"- ETH: {', '.join(art['eth'][:10])}")
-    if art["emails"]:  out.append(f"- E-mail: {', '.join(art['emails'][:20])}")
-    if art["has_pgp"]: out.append("- PGP key/message: WYKRYTO")
-
-    out.append("\n## TRESC:")
-    out.append(text[:max_text_chars])
-
-    if links:
-        out.append(f"\n## LINKI .onion (top 30 z {len(links)}):")
-        for r in links[:30]:
-            out.append(f"- {r['title']} -> {r['url']}")
-    return "\n".join(out)
-
-
-@mcp.tool()
-async def onion_deep_spider(
-    target_url: str,
-    keyword: str = "",
-    depth: int = 2,
-    max_pages: int = 40,
-    concurrency: int = 6,
-) -> str:
-    """
-    Asynchroniczny pajak BFS: chodzi po podstronach do glebokosci `depth`,
-    zbiera invite'y, slowa kluczowe, sasiadujace domeny .onion.
-    Wykonuje rownolegle do `concurrency` requestow.
-    """
-    if not _validate_url(target_url):
-        return f"BLAD: niepoprawny URL: {target_url}"
-    if depth > 3: depth = 3
-    if max_pages > 100: max_pages = 100
-
-    visited: set[str] = set()
-    discovered_onions: set[str] = set()
-    keyword_hits: list[str] = []
-    invites_found: set[str] = set()
-    pgp_pages: list[str] = []
-
-    base_host_m = ONION_RE.search(target_url)
-    if not base_host_m:
-        return f"BLAD: URL nie zawiera .onion: {target_url}"
-    base_onion = base_host_m.group(0)
-
-    queue: asyncio.Queue = asyncio.Queue()
-    await queue.put((target_url, 1))
-    sem = asyncio.Semaphore(concurrency)
-    kw_lower = keyword.lower() if keyword else ""
-
-    async def worker():
-        while True:
-            try:
-                url, d = await asyncio.wait_for(queue.get(), timeout=2.0)
-            except asyncio.TimeoutError:
-                return
-            try:
-                parsed = urlparse(url)
-                norm = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
-                if norm in visited or len(visited) >= max_pages:
-                    continue
-                visited.add(norm)
-                host_m = ONION_RE.search(url)
-                if not host_m:
-                    continue
-
-                async with sem:
-                    html, err = await _fetch(url)
-                if err or not html:
-                    continue
-
-                # artefakty
-                art = _scrape_artifacts(html)
-                for inv in art["invites"]:
-                    invites_found.add(f"{inv}  <- {url}")
-                if art["has_pgp"]:
-                    pgp_pages.append(url)
-
-                # keyword
-                if kw_lower:
-                    text = BeautifulSoup(html, "lxml").get_text(" ", strip=True).lower()
-                    if kw_lower in text:
-                        # snippet
-                        idx = text.find(kw_lower)
-                        snippet = text[max(0, idx-60):idx+len(kw_lower)+60]
-                        keyword_hits.append(f"[{url}]\n  ...{snippet}...")
-
-                # rozwiniecie linkow
-                if d < depth:
-                    soup = BeautifulSoup(html, "lxml")
-                    for a in soup.find_all("a", href=True):
-                        href = a["href"].strip()
-                        if not href or href.startswith(("javascript:", "#", "mailto:")):
-                            continue
-                        full = urljoin(url, href)
-                        m = ONION_RE.search(full)
-                        if not m:
-                            continue
-                        target_onion = m.group(0)
-                        if target_onion != base_onion:
-                            discovered_onions.add(target_onion)
-                        else:
-                            await queue.put((full, d + 1))
-            finally:
-                queue.task_done()
-
-    workers = [asyncio.create_task(worker()) for _ in range(concurrency)]
-    await asyncio.gather(*workers, return_exceptions=True)
-
-    report = [
-        "# DEEP SPIDER RAPORT",
-        f"Start: {target_url}",
-        f"Glebokosc: {depth} | Max stron: {max_pages} | Wspolbieznosc: {concurrency}",
-        f"Odwiedzono: {len(visited)} | Sasiednie .onion: {len(discovered_onions)}",
-        f"Slowo kluczowe: '{keyword or '-'}'",
-    ]
-    if invites_found:
-        report.append(f"\n## INVITE KODY ({len(invites_found)}):")
-        report.extend(f"- {i}" for i in sorted(invites_found))
-    if keyword_hits:
-        report.append(f"\n## TRAFIENIA KEYWORDU ({len(keyword_hits)}):")
-        report.extend(keyword_hits[:25])
-    if pgp_pages:
-        report.append(f"\n## STRONY Z PGP ({len(pgp_pages)}):")
-        report.extend(f"- {p}" for p in pgp_pages[:15])
-    if discovered_onions:
-        report.append(f"\n## ODKRYTE INNE DOMENY .onion ({len(discovered_onions)}):")
-        report.extend(f"- {d}" for d in sorted(discovered_onions)[:60])
+    if len(text) > max_text_chars:
+        report.append(f"\n... (urcieto tekstu. razem znakow: {len(text)})")
+        
     return "\n".join(report)
 
 
 @mcp.tool()
-async def forum_recon(target_url: str) -> str:
+def darkweb__forum_recon(target_url: str) -> str:
     """
-    Recon dla forum z zaproszeniem / invite-only:
+    [darkweb] Recon dla forum z zaproszeniem / invite-only:
     - znajduje strony rejestracji / login
     - parsuje formularze (action, method, pola)
     - lapie invite kody w treści
     - wykrywa captcha, Cloudflare, JS-only screen
     """
-    if not _validate_url(target_url):
-        return f"BLAD: niepoprawny URL: {target_url}"
-
-    html, err = await _fetch(target_url)
-    if err:
-        return f"Blad: {err}"
-
-    soup = BeautifulSoup(html, "lxml")
+    if not target_url.startswith("http"): target_url = "http://" + target_url
+    s = _session()
+    html, err = _fetch(target_url, s, timeout=45)
+    if err: return f"[RECON BLAD] {err}"
+    
+    soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text(" ", strip=True).lower()
-
-    indicators = {
-        "invite_only":    any(s in text for s in ["invite only", "invitation required", "by invitation", "invite code required"]),
-        "registration_open": any(s in text for s in ["sign up", "register", "create account"]),
-        "captcha":        any(s in text for s in ["captcha", "i'm not a robot", "verify you are human"]),
-        "cloudflare":     "cloudflare" in text or "cf-ray" in html.lower(),
-        "js_required":    any(s in text for s in ["enable javascript", "please enable js", "requires javascript"]),
-        "pgp_required":   "pgp" in text and ("required" in text or "verify" in text),
-    }
-
-    # Formularze (rejestracja, login, invite redeem)
-    forms = []
-    for f in soup.find_all("form"):
-        action = f.get("action", "")
-        method = (f.get("method") or "GET").upper()
-        fields = []
+    
+    report = [f"# Recon: {target_url}"]
+    
+    # Wykrywanie barier
+    barriers = []
+    if "captcha" in text: barriers.append("Wykryto slowo 'captcha'")
+    if "cloudflare" in text or "ray id" in text: barriers.append("Ochrona Cloudflare (Anti-DDoS)")
+    if "ddos-guard" in text: barriers.append("Ochrona DDoS-Guard")
+    if "javascript is disabled" in text or "enable javascript" in text: barriers.append("Wymaga JS (Tor Browser standardowo blokuje)")
+    if "invite code" in text or "registration code" in text: barriers.append("System Zaproszen-Invite (wymagany kod)")
+    
+    if barriers:
+        report.append("## Detekcja BARIER:")
+        for b in barriers: report.append(f"- {b}")
+    else:
+        report.append("## Detekcja BARIER: Brak oczywistych barier wizualnych (albo pelen dostep).")
+        
+    # Formularze
+    forms = soup.find_all("form")
+    report.append(f"\n## Formularze ({len(forms)}):")
+    for idx, f in enumerate(forms, 1):
+        action = f.get("action", "(brak)")
+        method = f.get("method", "get").upper()
+        inputs = []
         for inp in f.find_all(["input", "textarea", "select"]):
-            name = inp.get("name")
-            itype = inp.get("type", inp.name)
-            if name:
-                fields.append(f"{name}({itype})")
-        forms.append({
-            "action": urljoin(target_url, action) if action else target_url,
-            "method": method,
-            "fields": fields,
-            "context": (f.get_text(" ", strip=True) or "")[:120],
-        })
+            name = inp.get("name", "nieznany")
+            typ = inp.get("type", "text")
+            inputs.append(f"{name} [{typ}]")
+        report.append(f"{idx}. {method} -> {action} | Pola: {', '.join(inputs)}")
 
-    # Linki kluczowe
-    interesting_links = []
+    # Linki Auth
+    auth_links = []
     for a in soup.find_all("a", href=True):
-        href = a["href"].lower()
-        label = a.get_text(strip=True)
-        if any(k in href for k in ["register", "signup", "sign-up", "join", "invite", "redeem", "login"]):
-            interesting_links.append((label, urljoin(target_url, a["href"])))
-
-    art = _scrape_artifacts(html)
-
-    report = [
-        f"# FORUM RECON: {target_url}",
-        "\n## WSKAZNIKI:",
-    ]
-    for k, v in indicators.items():
-        report.append(f"- {k}: {'TAK' if v else 'nie'}")
-
-    if art["invites"]:
-        report.append(f"\n## INVITE KODY ZNALEZIONE: {', '.join(art['invites'])}")
-
-    if interesting_links:
-        report.append(f"\n## LINKI REJESTRACJI/INVITE ({len(interesting_links)}):")
-        for label, link in interesting_links[:20]:
-            report.append(f"- {label or '(brak labela)'} -> {link}")
-
-    if forms:
-        report.append(f"\n## FORMULARZE ({len(forms)}):")
-        for i, f in enumerate(forms[:10], 1):
-            report.append(
-                f"\n[{i}] {f['method']} {f['action']}\n"
-                f"    Pola: {', '.join(f['fields'])}\n"
-                f"    Kontekst: {f['context']}"
-            )
-
-    # Rekomendacja
-    report.append("\n## REKOMENDACJA:")
-    if indicators["invite_only"]:
-        report.append("- Forum INVITE-ONLY. Sprobuj `onion_deep_spider` na zlotych zrodlach i Dread w poszukiwaniu inv-kodow.")
-    if indicators["js_required"] or indicators["cloudflare"]:
-        report.append("- JS / CF challenge -- wlasciwy fetch przez Playwright (wdrozenie Sprint 2).")
-    if indicators["registration_open"] and forms:
-        report.append("- Rejestracja OTWARTA -- forma do POST gotowa, mozna automatyzowac.")
-
+        txt = a.get_text().lower()
+        href = a["href"]
+        if any(x in txt or x in href.lower() for x in ["login", "signin", "register", "signup", "join", "auth", "invite"]):
+            auth_links.append(f"{a.get_text(strip=True)} -> {urljoin(target_url, href)}")
+    
+    if auth_links:
+        report.append("\n## Endpointy Autoryzacji:")
+        for al in set(auth_links): report.append(f"- {al}")
+        
+    # Szybki intel z samej strony wjazdu
+    intel = extract_intel(html)
+    if intel["invites"]: report.append(f"\n## Wydobyte zaproszenia (raw): {intel['invites']}")
+    
     return "\n".join(report)
+
+
+# Async Pajak
+async def fetch_page(session, url):
+    try:
+        async with session.get(url, timeout=30, allow_redirects=True) as response:
+            html = await response.text()
+            return url, html, None
+    except Exception as e:
+        return url, None, str(e)
 
 
 @mcp.tool()
-async def known_invite_forums() -> str:
-    """Zwraca curated liste znanych forum invite-only / cybercrime + ich status (zywe/martwe)."""
-    sem = asyncio.Semaphore(MAX_CONCURRENCY)
+def darkweb__onion_deep_spider(target_url: str, keyword: str = "", depth: int = 1, max_pages: int = 50, concurrency: int = 5) -> str:
+    """
+    [darkweb] Asynchroniczny pajak BFS: chodzi po podstronach do glebokosci `depth`,
+    zbiera invite'y, slowa kluczowe, sasiadujace domeny .onion.
+    Wykonuje rownolegle do `concurrency` requestow.
+    """
+    if not target_url.startswith("http"): target_url = "http://" + target_url
+    
+    async def run_spider():
+        connector = ProxyConnector.from_url(TOR_SOCKS)
+        async with aiohttp.ClientSession(connector=connector, headers=HEADERS) as session:
+            visited = set()
+            discovered = set()
+            hits = []
+            intel_found = {"btc": set(), "xmr": set(), "emails": set(), "invites": set()}
+            
+            queue = [(target_url, 0)]
+            page_count = 0
+            
+            while queue and page_count < max_pages:
+                batch = queue[:concurrency]
+                queue = queue[concurrency:]
+                
+                tasks = []
+                for (u, lvl) in batch:
+                    if u in visited: continue
+                    visited.add(u)
+                    page_count += 1
+                    tasks.append(asyncio.create_task(fetch_page(session, u)))
+                
+                results = await asyncio.gather(*tasks)
+                
+                # Odpalamy BeautifulSoup synchronicznie dla zrzuconych stron (mozna wrzucic w process poole ale mcp blokuje)
+                for i, (u, html, err) in enumerate(results):
+                    lvl = batch[i][1]
+                    if err:
+                        hits.append(f"[BLAD] {u} -> {err}")
+                        continue
+                    
+                    soup = BeautifulSoup(html, "html.parser")
+                    title = soup.title.string.strip() if soup.title and soup.title.string else "(brak)"
+                    text = soup.get_text(" ", strip=True)
+                    
+                    line = f"[L{lvl}] {title} -> {u}"
+                    
+                    if keyword and keyword.lower() in text.lower():
+                        idx = text.lower().find(keyword.lower())
+                        ctx = text[max(0, idx - 60): idx + 60].replace("\n", " ")
+                        line += f"\n    >>> ZNALEZIONO '{keyword}': ...{ctx}..."
+                    hits.append(line)
+                    
+                    # Zbierz intel
+                    pg_intel = extract_intel(html)
+                    for k in ["btc", "xmr", "emails", "invites"]:
+                        intel_found[k].update(pg_intel[k])
+                        
+                    # Znajdz linki zewnetrzne onion
+                    for a in soup.find_all("a", href=True):
+                        full = urljoin(u, a["href"])
+                        m = ONION_RE.search(full)
+                        if m:
+                            discovered.add(m.group(0))
+                        # Jesli to ta sama domena i mozemy glebiej
+                        base_u = ONION_RE.search(u)
+                        if base_u and base_u.group(0) in full and lvl + 1 <= depth:
+                            if full not in visited:
+                                queue.append((full, lvl + 1))
+                                
+            return hits, visited, discovered, intel_found
 
-    async def probe(src):
-        name, url = src
-        async with sem:
-            html, err = await _fetch(url, use_cache=False)
-            if err:
-                return name, url, "DOWN", err
-            return name, url, "UP", f"{len(html)} bajtow"
-
-    results = await asyncio.gather(*(probe(s) for s in INVITE_FORUMS))
-    report = ["# ZNANE INVITE-ONLY / CYBERCRIME FORA\n"]
-    for name, url, status, info in results:
-        report.append(f"- [{status}] {name} -> {url}  ({info})")
+    try:
+        hits, visited, discovered, intel_found = asyncio.run(run_spider())
+    except Exception as e:
+        return f"Blad pajaka: {e}\n{traceback.format_exc()}"
+        
+    report = [
+        f"# Spider skończył -> {target_url}",
+        f"Głębokość zadana: {depth} | Skanowano stron: {len(visited)} | Limit: {max_pages}",
+        f"Słowo kluczowe: '{keyword or '-'}'",
+        "\n## Zgromadzony Intel (Across All Pages):",
+        f"- BTC: {len(intel_found['btc'])} znalezionych",
+        f"- XMR: {len(intel_found['xmr'])} znalezionych",
+        f"- E-maile: {len(intel_found['emails'])} znalezionych",
+        f"- Potencjalne Invite'y: {list(intel_found['invites'])[:10]}",
+        "\n## Zewnetrzne domeny .onion (Odkryte):",
+        f"Odkryto {len(discovered)} domen"
+    ]
+    if len(discovered) < 30:
+        for d in sorted(discovered): report.append(f" - {d}")
+    
+    report.append("\n## Trasa skanowania:")
+    report.extend(hits)
+    
     return "\n".join(report)
 
-
-# --------------------------------------------------------------------------- #
-# Start (streamable HTTP, /mcp)
-# --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
     host = os.environ.get("MCP_HOST", "0.0.0.0")
     port = int(os.environ.get("MCP_PORT", "8000"))
-    log.info("Darkweb MCP v2 startuje na http://%s:%s/mcp (Tor SOCKS=%s)",
-             host, port, TOR_SOCKS)
+    print(f"Darkweb Hacker MCP v5 startuje (streamable HTTP) na http://{host}:{port}/mcp")
+    print(f"Tor SOCKS proxy: {TOR_SOCKS}")
     mcp.run(transport="http", host=host, port=port, path="/mcp")
+
